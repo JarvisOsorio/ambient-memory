@@ -2,7 +2,13 @@
 
 **Zero-config ambient memory for AI engineers** — a local-first context layer that passively remembers what you worked on and exposes it to Cursor / Claude Desktop over MCP.
 
-No Markdown vault. No Git sync. No OAuth. Install in ~60 seconds and ask your agent *“what was I just doing?”*
+No Markdown vault. No Git sync. No OAuth. No native C++ / `node-gyp` install. After npm publish:
+
+```bash
+npx -y ambient-memory init
+npx -y ambient-memory start --screen auto
+npx -y ambient-memory mcp
+```
 
 ```mermaid
 flowchart LR
@@ -11,147 +17,113 @@ flowchart LR
     S[Screen sessions]
     B[Browser history]
   end
-  subgraph Vault["~/.ambient-memory"]
-    K[Keychain / file key]
-    DB[(Encrypted SQLite + FTS5)]
+  subgraph Daemon["Daemon (sole SQLite owner)"]
+    DB[(node:sqlite / sql.js WASM)]
+    IPC[Unix socket / named pipe]
   end
-  subgraph Consume
+  subgraph Clients
     CLI[ambient CLI]
-    MCP[MCP tools / prompts / resources]
+    MCP[MCP stdio]
   end
   W --> DB
   S --> DB
   B --> DB
-  K --> DB
-  DB --> CLI
-  DB --> MCP
+  DB --- IPC
+  IPC --> CLI
+  IPC --> MCP
 ```
 
-## Why engineers install this
+## Why v0.3
 
-1. **MCP that agents actually use** — `memory_search`, `memory_recent`, `memory_get`, `memory_context`, `memory_relate`, `memory_status` with filters, pagination, typed errors, resources, and prompts.
-2. **Retrieval that isn’t toy** — SQLite FTS5 + BM25, recency boost, path boost; eval fixtures for realistic queries.
-3. **Privacy you’d ship** — keychain-first master key, AES-GCM field encryption, seal-on-stop vault, expanded secret redaction, integrity HMAC, no telemetry.
-4. **Ingestion you can trust** — chokidar + debounce, ignore globs, secret file denies, size/binary/symlink guards, incremental `content_hash` reindex.
-5. **DX that respects your time** — `ambient context --minutes 30`, `doctor`, dry-run, systemd/launchd examples, one-command tests.
+1. **True zero-config install** — `node:sqlite` on Node 22+, `sql.js` WASM fallback on Node 20. No `better-sqlite3`.
+2. **Daemon-owned vault** — only the daemon opens/seals SQLite; CLI/MCP are IPC clients (no seal races).
+3. **npx-ready** — `ambient` and `ambient-memory` bins for `npx -y ambient-memory mcp`.
+4. **Honest crypto** — AES-GCM field encryption + sealed `.enc` at rest; FTS is redacted plaintext while unlocked (documented, not theater).
+5. **Noise control** — ignore Slack/Spotify/etc., dedupe focus churn, session summarization for signal-heavy `memory_context`.
 
-## 60-second install
+## Install
+
+Requires **Node.js 20+** (22+ preferred for built-in SQLite).
 
 ```bash
-# from clone or unpacked release tarball
-cd ambient-memory
-npm install          # needs Node 20+; see Native deps if better-sqlite3 fails
-npm test             # one command
-npm run demo
+# after publish
+npx -y ambient-memory init
+npx -y ambient-memory start --screen auto    # headless: --screen simulated
 
+# from this repo (pre-publish)
+npm install
+npm test
 node ./bin/ambient.js init
-node ./bin/ambient.js start --screen auto    # headless: --screen simulated
-node ./bin/ambient.js context --minutes 30
-node ./bin/ambient.js search "auth middleware"
 ```
 
-Until published to npm, use `node ./bin/ambient.js` or `./node_modules/.bin/ambient` from this directory.
-
-## MCP setup (copy-paste)
-
-### Cursor
-
-Cursor → Settings → MCP:
+### MCP — Cursor
 
 ```json
 {
   "mcpServers": {
     "ambient-memory": {
-      "command": "node",
-      "args": ["/ABSOLUTE/PATH/TO/ambient-memory/bin/ambient.js", "mcp"]
+      "command": "npx",
+      "args": ["-y", "ambient-memory", "mcp"]
     }
   }
 }
 ```
 
-### Claude Desktop
-
-Edit `claude_desktop_config.json`:
+### MCP — Claude Desktop
 
 ```json
 {
   "mcpServers": {
     "ambient-memory": {
-      "command": "node",
-      "args": ["/ABSOLUTE/PATH/TO/ambient-memory/bin/ambient.js", "mcp"]
+      "command": "npx",
+      "args": ["-y", "ambient-memory", "mcp"]
     }
   }
 }
 ```
 
-**Tools:** `memory_search` · `memory_recent` · `memory_get` · `memory_context` · `memory_relate` · `memory_status`  
-**Resources:** `ambient://status` · `ambient://recent` · `ambient://context`  
-**Prompts:** `recall_recent_work` · `search_project_memory`
-
-Ask: *“Use memory_context for the last 30 minutes and summarize what I was working on.”*
-
-## Privacy & threat model
-
-| Trust boundary | Assumption |
-|----------------|------------|
-| This machine’s user | Trusted — can read `~/.ambient-memory` if they own the account |
-| Other local users | Blocked by `0700`/`0600` perms + optional OS keychain |
-| Network / cloud | **No telemetry, no sync** in v0.2 |
-| Indexed files | Content is redacted then encrypted at rest; FTS holds redacted plaintext for search |
-| Compromised process with your UID | Can read the unlocked DB while the daemon/MCP runs (same as any local app) |
-| At rest (daemon stopped) | Plaintext `memory.db` must be absent; only `memory.db.enc` (+ keychain/file key) |
-
-**Controls:** OS keychain when available (macOS Keychain / Linux `secret-tool` / Windows CredMan best-effort) else `master.key` mode `0600`; AES-256-GCM fields; **seal to `memory.db.enc` on daemon stop and on CLI one-shots when the daemon is not running**; HMAC integrity meta; secret redaction (API keys, PATs, JWTs, PEM, connection strings, …); exclude paths + ignore globs; `ambient forget --all --yes`. See [SECURITY.md](./SECURITY.md).
-
-Force file key: `--file-key` or `AMBIENT_FORCE_FILE_KEY=1`.
-
-## Architecture (short)
-
-- **Daemon** watches Documents/Desktop/Downloads/cwd (override with `--roots` / `--exclude`)
-- **Store** SQLite WAL + encrypted entity fields + FTS5 index of redacted text
-- **Screen** `xdotool` / `osascript` / `simulated` / `none` with session boundaries
-- **Browser** optional Chrome/Firefox/Edge history; skips cleanly when locked/absent
-- **CLI / MCP / library exports** share the same `MemoryStore`
+`mcp` auto-starts the daemon if needed. **Tools:** `memory_search` · `memory_recent` · `memory_get` · `memory_context` · `memory_relate` · `memory_status`
 
 ## CLI
 
 ```bash
-ambient init | start | stop | status | doctor
-ambient search "query" [--type file,url] [--path-prefix /proj] [--since-mins 60] [-n 10]
-ambient recent | context --minutes 30 [--json]
-ambient forget "query" --yes | forget --all --yes
-ambient mcp
-ambient start --dry-run --screen simulated
+ambient-memory init | start | stop | status | doctor
+ambient-memory search "query" [--type file,url] [--since-mins 60]
+ambient-memory recent | context --minutes 30 [--json]
+ambient-memory forget "query" --yes | forget --all --yes
+ambient-memory mcp
 ```
 
-## Native dependencies (`better-sqlite3`)
+## Privacy & crypto (honest)
 
-| OS | Need |
-|----|------|
-| macOS | Xcode CLT (`xcode-select --install`) |
-| Linux | `build-essential` + `python3` |
-| Windows | VS Build Tools (C++), **x64** Node |
+| Layer | Behavior |
+|-------|----------|
+| Entity fields | AES-256-GCM |
+| At rest | `memory.db.enc` only when daemon stopped |
+| FTS while unlocked | Redacted **plaintext** (search tradeoff) |
+| Network | No telemetry / sync in v0.3 |
+| Process model | Daemon owns DB; clients use IPC |
+
+See [SECURITY.md](./SECURITY.md).
+
+## Architecture
+
+- **Daemon** watches Documents/Desktop/Downloads/cwd; indexes screen/browser with noise filters
+- **Store** SQLite via `node:sqlite` or `sql.js`; FTS5/BM25; field encryption; seal-on-stop
+- **IPC** Unix socket `~/.ambient-memory/ambient.sock` (Windows named pipe)
+- **CLI / MCP** never open SQLite directly in normal operation
+
+Force WASM backend: `AMBIENT_SQLITE_BACKEND=sql.js`. Force file key: `--file-key` / `AMBIENT_FORCE_FILE_KEY=1`.
 
 ## Development
 
 ```bash
 npm install && npm test && npm run demo
-npm run pack:release   # release/ambient-memory-0.2.0.{tar.gz,zip}
 ```
-
-CI: `.github/workflows/ci.yml` (Ubuntu / macOS / Windows).
-
-Optional units: `packaging/systemd/`, `packaging/launchd/`.
 
 ## Version
 
-**0.2.1** — OR multi-term search, reliable seal-at-rest, honest doctor, clean `npm audit` (Zod override).
-
-### Known limitations (honest)
-
-- Screen/browser capture is best-effort (permissions / locked DBs / Windows → `simulated`/`none`)
-- FTS keeps **redacted** plaintext for search; vault fields stay encrypted — see threat model
-- Same-UID malware can read an unlocked vault while the daemon/MCP is running (normal for local apps)
+**0.3.0** — breaking: no native SQLite addon; daemon-owned IPC; noise control; npx bins.
 
 ## License
 
