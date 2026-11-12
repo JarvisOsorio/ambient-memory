@@ -1,0 +1,12 @@
+node_modules/
+dist/
+release/
+*.db
+*.db-wal
+*.db-shm
+*.db.enc
+.ambient-memory/
+coverage/
+.DS_Store
+*.log
+.tmpdir/
