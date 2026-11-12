@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent example.
+  1. Copy project somewhere stable, e.g. ~/Applications/ambient-memory
+  2. Edit the ProgramArguments paths below
+  3. launchctl load ~/Library/LaunchAgents/com.ambientmemory.daemon.plist
+-->
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.ambientmemory.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/usr/local/bin/node</string>
+      <string>/Users/YOU/Applications/ambient-memory/bin/ambient.js</string>
+      <string>start</string>
+      <string>--foreground</string>
+      <string>--screen</string>
+      <string>auto</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/.ambient-memory/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/.ambient-memory/launchd.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>PATH</key>
+      <string>/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+  </dict>
+</plist>

@@ -1,0 +1,23 @@
+[Unit]
+Description=Ambient Memory local indexer daemon
+Documentation=file:///opt/ambient-memory/README.md
+After=default.target
+
+[Service]
+Type=simple
+# Run as a user service (recommended):
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/systemd/ambient-memory.service ~/.config/systemd/user/
+#   # edit ExecStart path below to your install
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ambient-memory.service
+Environment=NODE_ENV=production
+WorkingDirectory=%h/ambient-memory
+ExecStart=/usr/bin/node %h/ambient-memory/bin/ambient.js start --foreground --screen auto
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
