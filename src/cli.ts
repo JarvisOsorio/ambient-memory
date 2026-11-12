@@ -3,8 +3,8 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { Command } from "commander";
 import { APP_NAME, APP_VERSION, buildConfig, type AmbientConfig } from "./config/defaults.js";
+import { ensureDaemonRunning, withDaemonClient } from "./indexer/ensure-daemon.js";
 import {
-  AmbientDaemon,
   isProcessAlive,
   readPid,
   runDaemonForeground,
@@ -13,6 +13,9 @@ import { probeScreen } from "./indexer/screen.js";
 import { listRedactionKinds } from "./privacy/redact.js";
 import { startMcpServer } from "./mcp/server.js";
 import { MemoryStore } from "./store/memory-store.js";
+import { detectSqliteBackend } from "./store/sqlite.js";
+import { ipcEndpoint } from "./ipc/paths.js";
+import type { ContextSummary, MemoryEntity, SearchHit } from "./store/memory-store.js";
 
 function resolveConfig(opts: {
   dataDir?: string;
@@ -36,26 +39,18 @@ function resolveConfig(opts: {
   });
 }
 
-async function openStore(config: AmbientConfig): Promise<MemoryStore> {
-  return MemoryStore.openAsync(config);
-}
-
-/** Seal when the daemon is not holding the plaintext DB open. */
-function closeStore(store: MemoryStore, config: AmbientConfig): void {
-  const daemonUp = isProcessAlive(readPid(config.pidPath));
-  store.close(!daemonUp);
-}
-
 export async function runCli(argv: string[]): Promise<void> {
   const program = new Command();
   program
     .name("ambient")
-    .description("Zero-config ambient memory — local daemon, CLI, and MCP server")
+    .description(
+      "Zero-config ambient memory — daemon owns the vault; CLI/MCP are thin IPC clients",
+    )
     .version(APP_VERSION);
 
   program
     .command("start")
-    .description("Start the ambient indexer daemon")
+    .description("Start the ambient indexer daemon (sole process that opens SQLite)")
     .option("--foreground", "Run in the current terminal", false)
     .option("--data-dir <path>", "Override data directory")
     .option("--roots <paths>", `Watch roots separated by '${path.delimiter}'`)
@@ -68,6 +63,7 @@ export async function runCli(argv: string[]): Promise<void> {
       const existing = readPid(config.pidPath);
       if (isProcessAlive(existing)) {
         console.log(`Already running (pid ${existing})`);
+        console.log(`IPC: ${ipcEndpoint(config)}`);
         return;
       }
       if (existing && fs.existsSync(config.pidPath)) {
@@ -81,6 +77,7 @@ export async function runCli(argv: string[]): Promise<void> {
       if (opts.foreground) {
         console.log(`${APP_NAME} v${APP_VERSION} starting in foreground…`);
         console.log(`data: ${config.dataDir}${config.dryRun ? " (dry-run)" : ""}`);
+        console.log(`sqlite: ${detectSqliteBackend()}`);
         await runDaemonForeground(config);
         return;
       }
@@ -111,25 +108,23 @@ export async function runCli(argv: string[]): Promise<void> {
         },
       );
       child.unref();
-      let pid: number | null = null;
-      for (let i = 0; i < 25; i++) {
-        await new Promise((r) => setTimeout(r, 100));
-        pid = readPid(config.pidPath);
-        if (pid && isProcessAlive(pid)) break;
-      }
-      if (!pid || !isProcessAlive(pid)) {
-        console.error("Daemon failed to start — check logs:");
-        console.error(`  ${config.logPath}`);
+
+      try {
+        await ensureDaemonRunning(config, { timeoutMs: 8000, screen: opts.screen });
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : err);
         process.exitCode = 1;
         return;
       }
+      const pid = readPid(config.pidPath);
       console.log(`Started ambient daemon (pid ${pid})`);
+      console.log(`IPC: ${ipcEndpoint(config)}`);
       console.log(`Logs: ${config.logPath}`);
     });
 
   program
     .command("stop")
-    .description("Stop the ambient indexer daemon")
+    .description("Stop the ambient indexer daemon (daemon seals the vault)")
     .option("--data-dir <path>", "Override data directory")
     .option("--file-key", "Force file-backed master key", false)
     .action(async (opts) => {
@@ -137,8 +132,9 @@ export async function runCli(argv: string[]): Promise<void> {
       const pid = readPid(config.pidPath);
       if (!pid || !isProcessAlive(pid)) {
         console.log("Daemon is not running");
+        // Best-effort seal if plaintext leaked from a crash
         if (fs.existsSync(config.dbPath)) {
-          const store = await openStore(config);
+          const store = await MemoryStore.openAsync(config);
           store.close(true);
           console.log("Sealed encrypted store at rest");
         }
@@ -150,7 +146,7 @@ export async function runCli(argv: string[]): Promise<void> {
         return;
       }
       process.kill(pid, "SIGTERM");
-      for (let i = 0; i < 30; i++) {
+      for (let i = 0; i < 40; i++) {
         if (!isProcessAlive(pid)) break;
         await new Promise((r) => setTimeout(r, 100));
       }
@@ -165,7 +161,7 @@ export async function runCli(argv: string[]): Promise<void> {
         console.log(`Stopped ambient daemon (pid ${pid})`);
       }
       if (fs.existsSync(config.dbPath) && !isProcessAlive(pid)) {
-        const store = await openStore(config);
+        const store = await MemoryStore.openAsync(config);
         store.close(true);
         console.log("Sealed encrypted store at rest");
       }
@@ -178,68 +174,51 @@ export async function runCli(argv: string[]): Promise<void> {
 
   program
     .command("status")
-    .description("Show daemon and store health metrics")
+    .description("Show daemon and store health metrics (via IPC when daemon is up)")
     .option("--data-dir <path>", "Override data directory")
     .option("--file-key", "Force file-backed master key", false)
     .action(async (opts) => {
       const config = resolveConfig(opts);
       const pid = readPid(config.pidPath);
       const running = isProcessAlive(pid);
-      let storeStatus = null;
-      let watchRoots = config.watchRoots;
-      let screenProvider: string | undefined;
-      if (fs.existsSync(config.dbPath) || fs.existsSync(`${config.dbPath}.enc`)) {
-        const store = await openStore(config);
-        storeStatus = store.status();
-        const rootsRow = store.db.prepare(`SELECT value FROM meta WHERE key = 'watch_roots'`).get() as
-          | { value: string }
-          | undefined;
-        if (rootsRow?.value) {
-          try {
-            watchRoots = JSON.parse(rootsRow.value) as string[];
-          } catch {
-            /* keep */
-          }
-        }
-        const screenRow = store.db
-          .prepare(`SELECT value FROM meta WHERE key = 'screen_provider'`)
-          .get() as { value: string } | undefined;
-        screenProvider = screenRow?.value;
-        closeStore(store, config);
-      }
       const screen = await probeScreen(
         (config.screenProvider as "auto" | "simulated" | "none") ?? "auto",
       );
-      console.log(
-        JSON.stringify(
-          {
-            app: APP_NAME,
-            version: APP_VERSION,
-            running,
-            pid: running ? pid : null,
-            dataDir: config.dataDir,
-            watchRoots,
-            screenProvider: screenProvider ?? screen.resolved,
-            screenProbe: screen,
-            store: storeStatus,
-            sealedAtRest: !running && MemoryStore.isSealedAtRest(config.dbPath),
-            privacy: {
-              localOnly: true,
-              telemetry: false,
-              redactSecrets: true,
-              encryptedAtRest: true,
-              keyBackend: storeStatus?.keyBackend ?? null,
-            },
-          },
-          null,
-          2,
-        ),
-      );
+      let payload: Record<string, unknown> = {
+        app: APP_NAME,
+        version: APP_VERSION,
+        running,
+        pid: running ? pid : null,
+        dataDir: config.dataDir,
+        ipcEndpoint: ipcEndpoint(config),
+        sqliteBackendPreferred: detectSqliteBackend(),
+        screenProbe: screen,
+        sealedAtRest: !running && MemoryStore.isSealedAtRest(config.dbPath),
+        privacy: {
+          localOnly: true,
+          telemetry: false,
+          redactSecrets: true,
+          fieldEncryption: true,
+          ftsPlaintextWhileUnlocked: true,
+          sealedEnvelopeAtRest: true,
+        },
+      };
+      if (running) {
+        try {
+          const remote = await withDaemonClient(config, (c) => c.call("status"), {
+            autoStart: false,
+          });
+          payload = { ...payload, ...(remote as object), via: "ipc" };
+        } catch (err) {
+          payload.ipcError = err instanceof Error ? err.message : String(err);
+        }
+      }
+      console.log(JSON.stringify(payload, null, 2));
     });
 
   program
     .command("search")
-    .description("Search ambient memory (FTS5/BM25 + boosts)")
+    .description("Search ambient memory via daemon IPC")
     .argument("<query>", "Search query")
     .option("--data-dir <path>", "Override data directory")
     .option("-n, --limit <n>", "Max results", "10")
@@ -248,22 +227,24 @@ export async function runCli(argv: string[]): Promise<void> {
     .option("--path-prefix <prefix>", "Filter by path prefix")
     .option("--since-mins <n>", "Only last N minutes")
     .option("--file-key", "Force file-backed master key", false)
+    .option("--no-auto-start", "Do not auto-start daemon")
     .action(async (query, opts) => {
       const config = resolveConfig(opts);
-      const store = await openStore(config);
-      const sinceMs = opts.sinceMins
-        ? Date.now() - Number(opts.sinceMins) * 60_000
-        : undefined;
-      const hits = store.search(query, {
-        limit: Number(opts.limit),
-        offset: Number(opts.offset),
-        types: opts.type ? opts.type.split(",") : undefined,
-        pathPrefix: opts.pathPrefix,
-        sinceMs,
-      });
+      const hits = await withDaemonClient(
+        config,
+        (c) =>
+          c.call<SearchHit[]>("search", {
+            query,
+            limit: Number(opts.limit),
+            offset: Number(opts.offset),
+            types: opts.type ? opts.type.split(",") : undefined,
+            pathPrefix: opts.pathPrefix,
+            sinceMs: opts.sinceMins ? Date.now() - Number(opts.sinceMins) * 60_000 : undefined,
+          }),
+        { autoStart: opts.autoStart !== false },
+      );
       if (hits.length === 0) {
         console.log("No matches.");
-        closeStore(store, config);
         return;
       }
       for (const hit of hits) {
@@ -273,41 +254,49 @@ export async function runCli(argv: string[]): Promise<void> {
           }`,
         );
       }
-      closeStore(store, config);
     });
 
   program
     .command("recent")
-    .description("Show recently seen entities")
+    .description("Show recently seen entities via daemon IPC")
     .option("--data-dir <path>", "Override data directory")
     .option("-n, --limit <n>", "Max results", "10")
     .option("--type <types>", "Comma-separated types")
     .option("--file-key", "Force file-backed master key", false)
+    .option("--no-auto-start", "Do not auto-start daemon")
     .action(async (opts) => {
       const config = resolveConfig(opts);
-      const store = await openStore(config);
-      const entities = store.recent(Number(opts.limit), {
-        types: opts.type ? opts.type.split(",") : undefined,
-      });
+      const entities = await withDaemonClient(
+        config,
+        (c) =>
+          c.call<MemoryEntity[]>("recent", {
+            limit: Number(opts.limit),
+            types: opts.type ? opts.type.split(",") : undefined,
+          }),
+        { autoStart: opts.autoStart !== false },
+      );
       for (const e of entities) {
         const when = new Date(e.lastSeenAt).toISOString();
         console.log(`${when}  ${e.type.padEnd(8)}  ${e.title}`);
       }
       if (entities.length === 0) console.log("No entities yet. Start the daemon or run the demo.");
-      closeStore(store, config);
     });
 
   program
     .command("context")
-    .description("Narrative summary of what you were doing")
+    .description("Narrative summary of what you were doing (noise-filtered)")
     .option("--minutes <n>", "Lookback window", "30")
     .option("--data-dir <path>", "Override data directory")
     .option("--json", "Print full JSON", false)
     .option("--file-key", "Force file-backed master key", false)
+    .option("--no-auto-start", "Do not auto-start daemon")
     .action(async (opts) => {
       const config = resolveConfig(opts);
-      const store = await openStore(config);
-      const ctx = store.buildContext(Number(opts.minutes));
+      const ctx = await withDaemonClient(
+        config,
+        (c) => c.call<ContextSummary>("context", { minutes: Number(opts.minutes) }),
+        { autoStart: opts.autoStart !== false },
+      );
       if (opts.json) {
         console.log(JSON.stringify(ctx, null, 2));
       } else {
@@ -321,7 +310,6 @@ export async function runCli(argv: string[]): Promise<void> {
           for (const s of ctx.sessions.slice(0, 5)) console.log(`  - ${s.title}`);
         }
       }
-      closeStore(store, config);
     });
 
   program
@@ -332,6 +320,7 @@ export async function runCli(argv: string[]): Promise<void> {
     .option("--data-dir <path>", "Override data directory")
     .option("--yes", "Skip confirmation", false)
     .option("--file-key", "Force file-backed master key", false)
+    .option("--no-auto-start", "Do not auto-start daemon")
     .action(async (query, opts) => {
       if (!opts.all && !query) {
         console.error("Provide a query or --all");
@@ -344,46 +333,60 @@ export async function runCli(argv: string[]): Promise<void> {
         return;
       }
       const config = resolveConfig(opts);
-      const store = await openStore(config);
-      const result = store.forget(opts.all ? "*" : query);
+      const result = await withDaemonClient(
+        config,
+        (c) =>
+          c.call<{ deletedEntities: number; deletedEvents: number }>("forget", {
+            query: opts.all ? "*" : query,
+          }),
+        { autoStart: opts.autoStart !== false },
+      );
       console.log(
         `Forgot ${result.deletedEntities} entities and ${result.deletedEvents} events`,
       );
-      closeStore(store, config);
     });
 
   program
     .command("mcp")
-    .description("Run the MCP server on stdio (for Cursor / Claude Desktop)")
+    .description("Run the MCP server on stdio (thin IPC client to the daemon)")
     .option("--data-dir <path>", "Override data directory")
     .option("--file-key", "Force file-backed master key", false)
+    .option("--no-auto-start", "Do not auto-start daemon")
     .action(async (opts) => {
       const config = resolveConfig(opts);
-      await startMcpServer(config);
+      await startMcpServer(config, { autoStart: opts.autoStart !== false });
     });
 
   program
     .command("init")
-    .description("Create data dir + key with zero-config defaults (idempotent)")
+    .description("Create data dir + key; start daemon so vault is ready")
     .option("--data-dir <path>", "Override data directory")
     .option("--file-key", "Force file-backed master key", false)
+    .option("--screen <mode>", "Screen provider for auto-started daemon", "auto")
     .action(async (opts) => {
       const config = resolveConfig(opts);
-      const store = await openStore(config);
-      const status = store.status();
-      closeStore(store, config);
+      fs.mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
+      // Bootstrap key without leaving a racing DB open: start daemon which owns SQLite
+      const { started, pid } = await ensureDaemonRunning(config, {
+        screen: opts.screen ?? "auto",
+      });
+      const status = await withDaemonClient(config, (c) => c.call("status"), {
+        autoStart: false,
+      });
       const screen = await probeScreen("auto");
       console.log(
         JSON.stringify(
           {
             ok: true,
-            message: "Ambient memory ready — no questions asked",
+            message: "Ambient memory ready — daemon owns the vault",
             version: APP_VERSION,
             dataDir: config.dataDir,
+            ipcEndpoint: ipcEndpoint(config),
+            daemon: { started, pid },
             watchRoots: config.watchRoots,
-            store: status,
+            status,
             screenProbe: { resolved: screen.resolved, note: screen.note },
-            key: { backend: status.keyBackend, detail: status.keyDetail },
+            sqliteBackend: detectSqliteBackend(),
           },
           null,
           2,
@@ -393,7 +396,7 @@ export async function runCli(argv: string[]): Promise<void> {
 
   program
     .command("doctor")
-    .description("Diagnose screen/browser/key/store health on this machine")
+    .description("Diagnose screen/browser/key/store/IPC health")
     .option("--data-dir <path>", "Override data directory")
     .option("--screen <mode>", "Screen preference", "auto")
     .option("--file-key", "Force file-backed master key", false)
@@ -402,19 +405,27 @@ export async function runCli(argv: string[]): Promise<void> {
       const screen = await probeScreen(opts.screen ?? "auto");
       const { readRecentBrowserHistory } = await import("./indexer/browser.js");
       const browser = readRecentBrowserHistory();
-      let key = null;
-      let storeHealth = null;
       const issues: string[] = [];
       const notes: string[] = [];
-      try {
-        const store = await openStore({ ...config, forceFileKey: config.forceFileKey });
-        key = { backend: store.crypto.keyBackend, detail: store.crypto.keyDetail };
-        storeHealth = store.status();
-        if (!storeHealth.integrityOk) issues.push("Store integrity HMAC mismatch");
-        closeStore(store, config);
-      } catch (err) {
-        key = { error: err instanceof Error ? err.message : String(err) };
-        issues.push("Failed to open store/key");
+      const pid = readPid(config.pidPath);
+      let doctorRemote: unknown = null;
+      if (isProcessAlive(pid)) {
+        try {
+          doctorRemote = await withDaemonClient(config, (c) => c.call("doctor"), {
+            autoStart: false,
+          });
+        } catch (err) {
+          issues.push(
+            `Daemon pid alive but IPC failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      } else {
+        notes.push("Daemon not running — start with: npx ambient-memory start");
+        if (fs.existsSync(config.dbPath) && fs.existsSync(`${config.dbPath}.enc`)) {
+          issues.push(
+            "Plaintext memory.db present beside .enc while daemon is stopped — run ambient stop to re-seal",
+          );
+        }
       }
       if (screen.resolved === "none") {
         notes.push("No screen provider — use --screen simulated on headless hosts");
@@ -426,15 +437,8 @@ export async function runCli(argv: string[]): Promise<void> {
       if (browser.result.indexed === 0 && browser.result.skippedReason) {
         notes.push(`Browser optional: ${browser.result.skippedReason}`);
       }
-      const pid = readPid(config.pidPath);
       if (pid && !isProcessAlive(pid)) issues.push("Stale pidfile present (safe to delete via ambient stop)");
-      if (
-        !isProcessAlive(pid) &&
-        fs.existsSync(config.dbPath) &&
-        fs.existsSync(`${config.dbPath}.enc`)
-      ) {
-        issues.push("Plaintext memory.db present beside .enc while daemon is stopped — run ambient stop to re-seal");
-      }
+
       console.log(
         JSON.stringify(
           {
@@ -442,13 +446,20 @@ export async function runCli(argv: string[]): Promise<void> {
             version: APP_VERSION,
             platform: process.platform,
             node: process.version,
+            sqliteBackendPreferred: detectSqliteBackend(),
+            ipcEndpoint: ipcEndpoint(config),
             screen,
             browser: browser.result,
-            key,
-            store: storeHealth,
+            doctor: doctorRemote,
             sealedAtRest: MemoryStore.isSealedAtRest(config.dbPath),
             redactionKinds: listRedactionKinds().length,
             telemetry: false,
+            crypto: {
+              fieldEncryption: true,
+              sealedEnvelopeAtRest: true,
+              ftsPlaintextWhileUnlocked: true,
+              note: "FTS holds redacted plaintext while the daemon holds the vault open — intentional search tradeoff",
+            },
             issues,
             notes,
           },
