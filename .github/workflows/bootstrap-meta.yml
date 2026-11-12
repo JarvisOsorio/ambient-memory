@@ -1,0 +1,45 @@
+name: Bootstrap meta
+
+on:
+  push:
+    paths:
+      - ".github/workflows/bootstrap-meta.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set topics + create v0.2.1 release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            await github.rest.repos.replaceAllTopics({
+              owner,
+              repo,
+              names: ["mcp", "ai", "memory", "local-first"],
+            });
+            console.log("topics set");
+            try {
+              await github.rest.repos.getReleaseByTag({ owner, repo, tag: "v0.2.1" });
+              console.log("release v0.2.1 already exists");
+            } catch (e) {
+              if (e.status !== 404) throw e;
+              await github.rest.repos.createRelease({
+                owner,
+                repo,
+                tag_name: "v0.2.1",
+                name: "v0.2.1",
+                target_commitish: "main",
+                body: "Ambient Memory 0.2.1 — zero-config local ambient memory for AI agents (encrypted SQLite + MCP).\n\nHighlights:\n- FTS5 OR multi-term search with coverage boosts\n- Seal-at-rest vault (`memory.db.enc`)\n- MCP tools/resources/prompts for Cursor / Claude Desktop\n- Honest doctor + clean npm audit (Zod override)\n",
+                draft: false,
+                prerelease: false,
+                generate_release_notes: true,
+              });
+              console.log("created release v0.2.1");
+            }
