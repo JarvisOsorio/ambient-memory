@@ -27,17 +27,8 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
 
-      - name: Install (Unix)
-        if: runner.os != 'Windows'
+      - name: Install
         run: npm ci
-
-      - name: Install (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          # better-sqlite3 needs a working MSVC toolchain / windows-build-tools equivalent.
-          # GitHub windows-latest images include Visual Studio Build Tools.
-          npm ci
 
       - name: Test
         env:
