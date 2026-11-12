@@ -1,12 +1,21 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
-import path from "node:path";
-import Database from "better-sqlite3";
 import { EnvelopeCrypto } from "../crypto/envelope.js";
 import { redactSecrets } from "../privacy/redact.js";
 import type { AmbientConfig } from "../config/defaults.js";
+import {
+  dedupeByTitlePath,
+  isNoisyApp,
+  summarizeSessions,
+} from "../indexer/noise.js";
 import { SCHEMA_SQL, SCHEMA_VERSION } from "./schema.js";
 import { buildFtsQuery, rankScore, tokenize } from "./search.js";
+import {
+  detectSqliteBackend,
+  openSqliteDatabase,
+  openSqliteDatabaseSync,
+  type SqliteDatabase,
+} from "./sqlite.js";
 
 export type EntityType = "file" | "session" | "snippet" | "url" | "event";
 
@@ -69,7 +78,6 @@ export interface UpsertEntityInput {
   source?: string;
   metadata?: Record<string, unknown>;
   seenAt?: number;
-  /** Skip write if same contentHash already indexed */
   skipIfUnchanged?: boolean;
 }
 
@@ -78,11 +86,20 @@ export interface ContextSummary {
   sinceMs: number;
   untilMs: number;
   narrative: string;
-  sessions: Array<{ id: string; title: string; lastSeenAt: number }>;
+  sessions: Array<{
+    id: string;
+    title: string;
+    lastSeenAt: number;
+    appName?: string;
+    focusCount?: number;
+    durationMs?: number;
+  }>;
   files: Array<{ id: string; title: string; path?: string; lastSeenAt: number }>;
   urls: Array<{ id: string; title: string; path?: string; lastSeenAt: number }>;
   links: MemoryLink[];
   events: MemoryEvent[];
+  /** How many raw sessions were dropped as noise / collapsed. */
+  noise: { droppedSessions: number; collapsedSessions: number };
 }
 
 function contentHashOf(title: string, body?: string, filePath?: string): string {
@@ -94,7 +111,7 @@ function contentHashOf(title: string, body?: string, filePath?: string): string 
 }
 
 export class MemoryStore {
-  readonly db: Database.Database;
+  readonly db: SqliteDatabase;
   readonly crypto: EnvelopeCrypto;
   readonly config: AmbientConfig;
   private closed = false;
@@ -102,7 +119,7 @@ export class MemoryStore {
   /** True when this process decrypted memory.db.enc to open the store. */
   readonly restoredFromSeal: boolean;
 
-  constructor(config: AmbientConfig, cryptoSvc?: EnvelopeCrypto) {
+  constructor(config: AmbientConfig, cryptoSvc?: EnvelopeCrypto, db?: SqliteDatabase) {
     fs.mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
     this.config = config;
     this.crypto = cryptoSvc ?? EnvelopeCrypto.loadOrCreateKey(config.keyPath);
@@ -115,7 +132,18 @@ export class MemoryStore {
     }
     this.restoredFromSeal = restored;
 
-    this.db = new Database(config.dbPath);
+    this.db = db ?? openSqliteDatabaseSync(config.dbPath);
+    this.bootstrapSchema();
+  }
+
+  private bootstrapSchema(): void {
+    if (this.db.backend === "node-sqlite") {
+      try {
+        this.db.exec("PRAGMA journal_mode = WAL");
+      } catch {
+        /* ignore */
+      }
+    }
     this.db.exec(SCHEMA_SQL);
     this.migrate();
     this.db
@@ -130,8 +158,14 @@ export class MemoryStore {
          ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
       )
       .run(this.crypto.keyBackend);
+    this.db
+      .prepare(
+        `INSERT INTO meta(key, value) VALUES('sqlite_backend', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(this.db.backend);
     try {
-      fs.chmodSync(config.dbPath, 0o600);
+      if (fs.existsSync(this.config.dbPath)) fs.chmodSync(this.config.dbPath, 0o600);
     } catch {
       /* ignore */
     }
@@ -140,7 +174,7 @@ export class MemoryStore {
 
   private migrate(): void {
     const cols = this.db.prepare(`PRAGMA table_info(entities)`).all() as Array<{ name: string }>;
-    if (!cols.some((c) => c.name === "content_hash")) {
+    if (cols.length && !cols.some((c) => c.name === "content_hash")) {
       this.db.exec(`ALTER TABLE entities ADD COLUMN content_hash TEXT`);
     }
   }
@@ -150,19 +184,25 @@ export class MemoryStore {
       preferKeychain: config.preferKeychain !== false,
       forceFile: config.forceFileKey === true,
     });
-    return new MemoryStore(config, cryptoSvc);
+    fs.mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
+    const encPath = `${config.dbPath}.enc`;
+    if (!fs.existsSync(config.dbPath) && fs.existsSync(encPath)) {
+      cryptoSvc.decryptFile(encPath, config.dbPath);
+    }
+    const db = await openSqliteDatabase(config.dbPath);
+    return new MemoryStore(config, cryptoSvc, db);
   }
 
   /**
-   * Close the DB. When `seal` is true, encrypt to `.enc` and delete plaintext
-   * (including WAL/SHM). Prefer sealing for all CLI one-shots when the daemon
-   * is not running so plaintext never lingers beside the envelope.
+   * Close the DB. When `seal` is true, encrypt to `.enc` and delete plaintext.
+   * Prefer daemon-owned lifecycle — CLI/MCP should not open the DB directly.
    */
   close(seal = false): void {
     if (this.closed) return;
     this.updateIntegrity();
     try {
-      this.db.pragma("wal_checkpoint(TRUNCATE)");
+      this.db.checkpoint();
+      this.db.persist();
     } catch {
       /* best-effort */
     }
@@ -245,11 +285,8 @@ export class MemoryStore {
         ? crypto.createHash("sha256").update(`${input.type}:${input.path}`).digest("hex").slice(0, 32)
         : crypto.randomUUID().replace(/-/g, ""));
 
-    const hash =
-      input.contentHash ?? contentHashOf(input.title, input.body, input.path);
-    const existing = this.db.prepare(`SELECT * FROM entities WHERE id = ?`).get(id) as
-      | Record<string, unknown>
-      | undefined;
+    const hash = input.contentHash ?? contentHashOf(input.title, input.body, input.path);
+    const existing = this.db.prepare(`SELECT * FROM entities WHERE id = ?`).get(id);
 
     if (
       input.skipIfUnchanged &&
@@ -321,9 +358,7 @@ export class MemoryStore {
   }
 
   getEntity(id: string): MemoryEntity | undefined {
-    const row = this.db.prepare(`SELECT * FROM entities WHERE id = ?`).get(id) as
-      | Record<string, unknown>
-      | undefined;
+    const row = this.db.prepare(`SELECT * FROM entities WHERE id = ?`).get(id);
     return row ? this.rowToEntity(row) : undefined;
   }
 
@@ -369,7 +404,7 @@ export class MemoryStore {
       .prepare(
         `SELECT * FROM links WHERE from_id = ? OR to_id = ? ORDER BY created_at DESC LIMIT ?`,
       )
-      .all(entityId, entityId, limit) as Array<Record<string, unknown>>;
+      .all(entityId, entityId, limit);
     return rows.map((r) => ({
       id: String(r.id),
       fromId: String(r.from_id),
@@ -442,7 +477,7 @@ export class MemoryStore {
     }
     sql += ` ORDER BY last_seen_at DESC LIMIT ? OFFSET ?`;
     params.push(limit, offset);
-    const rows = this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+    const rows = this.db.prepare(sql).all(...params);
     let entities = rows.map((r) => this.rowToEntity(r));
     if (opts?.pathPrefix) {
       const prefix = opts.pathPrefix;
@@ -460,7 +495,7 @@ export class MemoryStore {
     }
     sql += ` ORDER BY occurred_at DESC LIMIT ?`;
     params.push(limit);
-    const rows = this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+    const rows = this.db.prepare(sql).all(...params);
     return rows.map((r) => ({
       id: String(r.id),
       kind: String(r.kind),
@@ -498,7 +533,7 @@ export class MemoryStore {
     const hits: SearchHit[] = [];
     const now = Date.now();
     for (const row of rows) {
-      const entity = this.getEntity(row.entity_id);
+      const entity = this.getEntity(String(row.entity_id));
       if (!entity) continue;
       if (opts.types?.length && !opts.types.includes(entity.type)) continue;
       if (opts.pathPrefix && !entity.path?.startsWith(opts.pathPrefix)) continue;
@@ -555,7 +590,7 @@ export class MemoryStore {
     }>;
     return rows
       .map((row) => {
-        const entity = this.getEntity(row.entity_id);
+        const entity = this.getEntity(String(row.entity_id));
         if (!entity) return null;
         return {
           entity,
@@ -569,20 +604,44 @@ export class MemoryStore {
   buildContext(minutes = 30): ContextSummary {
     const untilMs = Date.now();
     const sinceMs = untilMs - minutes * 60_000;
-    const entities = this.recent(80, { sinceMs, untilMs });
-    const sessions = entities
-      .filter((e) => e.type === "session")
-      .map((e) => ({ id: e.id, title: e.title, lastSeenAt: e.lastSeenAt }));
-    const files = entities
-      .filter((e) => e.type === "file")
-      .map((e) => ({ id: e.id, title: e.title, path: e.path, lastSeenAt: e.lastSeenAt }));
-    const urls = entities
-      .filter((e) => e.type === "url")
-      .map((e) => ({ id: e.id, title: e.title, path: e.path, lastSeenAt: e.lastSeenAt }));
-    const events = this.recentEvents(40, sinceMs);
+    const entities = this.recent(120, { sinceMs, untilMs });
+    const rawSessions = entities.filter((e) => e.type === "session");
+    const summarized = summarizeSessions(
+      rawSessions.map((e) => ({
+        id: e.id,
+        title: e.title,
+        lastSeenAt: e.lastSeenAt,
+        metadata: e.metadata,
+      })),
+      { noisyApps: this.config.noisyApps },
+    );
+    const sessions = summarized.map((s) => ({
+      id: s.id,
+      title: s.title,
+      lastSeenAt: s.lastSeenAt,
+      appName: s.appName,
+      focusCount: s.focusCount,
+      durationMs: s.durationMs,
+    }));
+    const files = dedupeByTitlePath(
+      entities
+        .filter((e) => e.type === "file")
+        .map((e) => ({ id: e.id, title: e.title, path: e.path, lastSeenAt: e.lastSeenAt })),
+    );
+    const urls = dedupeByTitlePath(
+      entities
+        .filter((e) => e.type === "url")
+        .map((e) => ({ id: e.id, title: e.title, path: e.path, lastSeenAt: e.lastSeenAt })),
+    );
+    const events = this.recentEvents(40, sinceMs).filter((ev) => {
+      if (ev.kind !== "screen_focus") return true;
+      const app = String((ev.payload as { appName?: string } | undefined)?.appName ?? "");
+      if (!app) return true;
+      return !isNoisyApp(app, this.config.noisyApps);
+    });
 
     const linkSet: MemoryLink[] = [];
-    for (const e of entities.slice(0, 20)) {
+    for (const e of [...sessions, ...files].slice(0, 20)) {
       for (const l of this.getLinks(e.id, 10)) {
         if (!linkSet.some((x) => x.id === l.id)) linkSet.push(l);
       }
@@ -592,6 +651,12 @@ export class MemoryStore {
       const link = this.relate(files[0].id, sessions[0].id, "opened_during", 1);
       if (!linkSet.some((x) => x.id === link.id)) linkSet.push(link);
     }
+
+    const droppedSessions = Math.max(0, rawSessions.length - summarized.length);
+    const collapsedSessions = Math.max(
+      0,
+      summarized.reduce((n, s) => n + (s.focusCount - 1), 0),
+    );
 
     const parts: string[] = [];
     parts.push(`Over the last ${minutes} minutes:`);
@@ -603,7 +668,7 @@ export class MemoryStore {
           .join(", ")}.`,
       );
     } else {
-      parts.push("No active window sessions were captured.");
+      parts.push("No high-signal window sessions were captured (noisy apps filtered).");
     }
     if (files.length) {
       parts.push(
@@ -619,6 +684,11 @@ export class MemoryStore {
           .slice(0, 3)
           .map((u) => u.title)
           .join(", ")}.`,
+      );
+    }
+    if (droppedSessions || collapsedSessions) {
+      parts.push(
+        `(Noise control: dropped ${droppedSessions} noisy sessions, collapsed ${collapsedSessions} duplicates.)`,
       );
     }
     if (linkSet.length) {
@@ -638,6 +708,7 @@ export class MemoryStore {
       urls: urls.slice(0, 10),
       links: linkSet.slice(0, 30),
       events: events.slice(0, 20),
+      noise: { droppedSessions, collapsedSessions },
     };
   }
 
@@ -676,6 +747,9 @@ export class MemoryStore {
     dataDir: string;
     dbBytes: number;
     encryptedAtRest: boolean;
+    /** Honest: FTS holds redacted plaintext while unlocked. */
+    ftsPlaintextWhileUnlocked: true;
+    fieldEncryption: true;
     keyBackend: string;
     keyDetail: string;
     schemaVersion: string;
@@ -683,12 +757,17 @@ export class MemoryStore {
     eventsPerMinute: number;
     integrityOk: boolean;
     fts: boolean;
+    sqliteBackend: string;
   } {
-    const entities = (
-      this.db.prepare(`SELECT COUNT(*) AS c FROM entities`).get() as { c: number }
-    ).c;
-    const links = (this.db.prepare(`SELECT COUNT(*) AS c FROM links`).get() as { c: number }).c;
-    const events = (this.db.prepare(`SELECT COUNT(*) AS c FROM events`).get() as { c: number }).c;
+    const entities = Number(
+      (this.db.prepare(`SELECT COUNT(*) AS c FROM entities`).get() as { c: number }).c,
+    );
+    const links = Number(
+      (this.db.prepare(`SELECT COUNT(*) AS c FROM links`).get() as { c: number }).c,
+    );
+    const events = Number(
+      (this.db.prepare(`SELECT COUNT(*) AS c FROM events`).get() as { c: number }).c,
+    );
     let dbBytes = 0;
     try {
       if (fs.existsSync(this.config.dbPath)) dbBytes = fs.statSync(this.config.dbPath).size;
@@ -708,6 +787,8 @@ export class MemoryStore {
       dataDir: this.config.dataDir,
       dbBytes,
       encryptedAtRest: true,
+      ftsPlaintextWhileUnlocked: true,
+      fieldEncryption: true,
       keyBackend: this.crypto.keyBackend,
       keyDetail: this.crypto.keyDetail,
       schemaVersion: SCHEMA_VERSION,
@@ -715,15 +796,14 @@ export class MemoryStore {
       eventsPerMinute: this.eventCounterWindow.length,
       integrityOk: this.verifyIntegrity(),
       fts: true,
+      sqliteBackend: this.db.backend || detectSqliteBackend(),
     };
   }
 
   updateIntegrity(): void {
-    const snap = this.db
-      .prepare(
-        `SELECT COUNT(*) AS entities FROM entities`,
-      )
-      .get() as { entities: number };
+    const snap = this.db.prepare(`SELECT COUNT(*) AS entities FROM entities`).get() as {
+      entities: number;
+    };
     const links = (this.db.prepare(`SELECT COUNT(*) AS c FROM links`).get() as { c: number }).c;
     const events = (this.db.prepare(`SELECT COUNT(*) AS c FROM events`).get() as { c: number }).c;
     const payload = `${snap.entities}:${links}:${events}`;
@@ -741,7 +821,7 @@ export class MemoryStore {
       | { value: string }
       | undefined;
     if (!row) return true;
-    const [payload, mac] = row.value.split("|");
+    const [payload, mac] = String(row.value).split("|");
     if (!payload || !mac) return false;
     const expect = this.crypto.hmac(payload);
     try {
@@ -754,12 +834,12 @@ export class MemoryStore {
   forget(query?: string): { deletedEntities: number; deletedEvents: number } {
     if (this.config.dryRun) return { deletedEntities: 0, deletedEvents: 0 };
     if (!query || query === "*" || query === "all") {
-      const deletedEntities = (
-        this.db.prepare(`SELECT COUNT(*) AS c FROM entities`).get() as { c: number }
-      ).c;
-      const deletedEvents = (
-        this.db.prepare(`SELECT COUNT(*) AS c FROM events`).get() as { c: number }
-      ).c;
+      const deletedEntities = Number(
+        (this.db.prepare(`SELECT COUNT(*) AS c FROM entities`).get() as { c: number }).c,
+      );
+      const deletedEvents = Number(
+        (this.db.prepare(`SELECT COUNT(*) AS c FROM events`).get() as { c: number }).c,
+      );
       this.db.exec(
         `DELETE FROM entities_fts; DELETE FROM search_terms; DELETE FROM links; DELETE FROM events; DELETE FROM entities; DELETE FROM sessions;`,
       );
@@ -772,9 +852,8 @@ export class MemoryStore {
     if (ids.length === 0) return { deletedEntities: 0, deletedEvents: 0 };
 
     const placeholders = ids.map(() => "?").join(",");
-    const deletedEvents = this.db
-      .prepare(`DELETE FROM events WHERE entity_id IN (${placeholders})`)
-      .run(...ids).changes;
+    this.db.prepare(`DELETE FROM events WHERE entity_id IN (${placeholders})`).run(...ids);
+    const deletedEvents = ids.length; // best-effort under sql.js
     this.db
       .prepare(
         `DELETE FROM links WHERE from_id IN (${placeholders}) OR to_id IN (${placeholders})`,
@@ -782,9 +861,8 @@ export class MemoryStore {
       .run(...ids, ...ids);
     this.db.prepare(`DELETE FROM search_terms WHERE entity_id IN (${placeholders})`).run(...ids);
     this.db.prepare(`DELETE FROM entities_fts WHERE entity_id IN (${placeholders})`).run(...ids);
-    const deletedEntities = this.db
-      .prepare(`DELETE FROM entities WHERE id IN (${placeholders})`)
-      .run(...ids).changes;
+    this.db.prepare(`DELETE FROM entities WHERE id IN (${placeholders})`).run(...ids);
+    const deletedEntities = ids.length;
     this.updateIntegrity();
     return { deletedEntities, deletedEvents };
   }
@@ -796,6 +874,10 @@ export class MemoryStore {
 
 export function openStore(config: AmbientConfig): MemoryStore {
   return new MemoryStore(config);
+}
+
+export async function openStoreAsync(config: AmbientConfig): Promise<MemoryStore> {
+  return MemoryStore.openAsync(config);
 }
 
 export function hashContent(title: string, body?: string, filePath?: string): string {

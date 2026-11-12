@@ -12,7 +12,7 @@ npm test
 npm run demo
 ```
 
-Requires **Node.js 20+**. `better-sqlite3` is a native addon — see README → *Native dependencies* if install fails.
+Requires **Node.js 20+** (22+ uses built-in `node:sqlite`; 20 uses `sql.js` WASM). No native C++ toolchain required.
 
 ## Project layout
 

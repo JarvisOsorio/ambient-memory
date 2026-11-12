@@ -1,7 +1,6 @@
-export const SCHEMA_VERSION = "2";
+export const SCHEMA_VERSION = "3";
 
 export const SCHEMA_SQL = `
-PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS meta (
@@ -62,7 +61,9 @@ CREATE TABLE IF NOT EXISTS search_terms (
 
 CREATE INDEX IF NOT EXISTS idx_search_terms_term ON search_terms(term);
 
--- FTS5 index over redacted plaintext (searchable locally; vault fields stay encrypted)
+-- FTS5 index over REDACTED PLAINTEXT intentionally (search tradeoff while unlocked).
+-- Entity columns remain AES-GCM field-encrypted; the sealed .enc envelope covers the
+-- whole DB file at rest when the daemon stops. See SECURITY.md.
 CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
   entity_id UNINDEXED,
   type UNINDEXED,

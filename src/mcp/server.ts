@@ -10,11 +10,38 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { AmbientConfig } from "../config/defaults.js";
 import { APP_NAME, APP_VERSION } from "../config/defaults.js";
-import { MemoryStore } from "../store/memory-store.js";
-import { handleMemoryTool, MCP_PROMPTS, MCP_TOOLS, renderPrompt } from "./tools.js";
+import type { IpcClient } from "../ipc/client.js";
+import type { MemoryStore } from "../store/memory-store.js";
+import {
+  handleMemoryTool,
+  handleMemoryToolRemote,
+  MCP_PROMPTS,
+  MCP_TOOLS,
+  renderPrompt,
+  renderPromptRemote,
+} from "./tools.js";
 
-export async function startMcpServer(config: AmbientConfig): Promise<void> {
-  const store = await MemoryStore.openAsync(config);
+export async function startMcpServer(
+  config: AmbientConfig,
+  opts: { autoStart?: boolean } = {},
+): Promise<void> {
+  // Keep a long-lived IPC connection for the life of the MCP stdio session.
+  const autoStart = opts.autoStart !== false;
+  let client: IpcClient | null = null;
+
+  const getClient = async (): Promise<IpcClient> => {
+    if (client) return client;
+    const { IpcClient: IC } = await import("../ipc/client.js");
+    if (autoStart) {
+      const { ensureDaemonRunning } = await import("../indexer/ensure-daemon.js");
+      await ensureDaemonRunning(config);
+    }
+    client = await IC.connect(config, 3000);
+    return client;
+  };
+
+  // Prime connection early so MCP tools fail fast with a clear error
+  await getClient();
 
   const server = new Server(
     { name: APP_NAME, version: APP_VERSION },
@@ -31,7 +58,8 @@ export async function startMcpServer(config: AmbientConfig): Promise<void> {
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const args = (request.params.arguments ?? {}) as Record<string, unknown>;
-    const result = handleMemoryTool(store, request.params.name, args);
+    const c = await getClient();
+    const result = await handleMemoryToolRemote(c, request.params.name, args);
     return {
       content: result.content,
       isError: result.isError,
@@ -63,20 +91,21 @@ export async function startMcpServer(config: AmbientConfig): Promise<void> {
 
   server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     const uri = request.params.uri;
+    const c = await getClient();
     if (uri === "ambient://status") {
-      const body = handleMemoryTool(store, "memory_status", {});
+      const body = await handleMemoryToolRemote(c, "memory_status", {});
       return {
         contents: [{ uri, mimeType: "application/json", text: body.content[0]!.text }],
       };
     }
     if (uri === "ambient://recent") {
-      const body = handleMemoryTool(store, "memory_recent", { limit: 15 });
+      const body = await handleMemoryToolRemote(c, "memory_recent", { limit: 15 });
       return {
         contents: [{ uri, mimeType: "application/json", text: body.content[0]!.text }],
       };
     }
     if (uri === "ambient://context") {
-      const body = handleMemoryTool(store, "memory_context", { minutes: 30 });
+      const body = await handleMemoryToolRemote(c, "memory_context", { minutes: 30 });
       return {
         contents: [{ uri, mimeType: "application/json", text: body.content[0]!.text }],
       };
@@ -105,7 +134,8 @@ export async function startMcpServer(config: AmbientConfig): Promise<void> {
     for (const [k, v] of Object.entries(request.params.arguments ?? {})) {
       args[k] = String(v);
     }
-    const text = renderPrompt(store, request.params.name, args);
+    const c = await getClient();
+    const text = await renderPromptRemote(c, request.params.name, args);
     return {
       description: request.params.name,
       messages: [
@@ -121,14 +151,18 @@ export async function startMcpServer(config: AmbientConfig): Promise<void> {
   await server.connect(transport);
 
   const shutdown = () => {
-    // MCP is a one-shot process relative to the vault — seal on exit.
-    store.close(true);
+    try {
+      client?.close();
+    } catch {
+      /* ignore */
+    }
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 }
 
+/** In-process handlers for tests that already hold a MemoryStore. */
 export function createMcpHandlers(store: MemoryStore) {
   return {
     listTools: () => MCP_TOOLS,

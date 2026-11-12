@@ -1,5 +1,15 @@
 import type { AmbientDaemon } from "../indexer/daemon.js";
-import type { EntityType, MemoryStore, SearchOptions } from "../store/memory-store.js";
+import type { IpcClient } from "../ipc/client.js";
+import type {
+  ContextSummary,
+  EntityType,
+  MemoryEntity,
+  MemoryEvent,
+  MemoryLink,
+  MemoryStore,
+  SearchHit,
+  SearchOptions,
+} from "../store/memory-store.js";
 import { APP_NAME, APP_VERSION } from "../config/defaults.js";
 
 export interface ToolResult {
@@ -242,8 +252,143 @@ export function handleMemoryTool(
             telemetry: false,
             secretsRedacted: store.config.redactSecrets,
             encryptedFields: true,
+            fieldEncryption: true,
+            ftsPlaintextWhileUnlocked: true,
+            sealedEnvelopeAtRest: true,
             dbSealedOnStop: true,
             keyBackend: store.crypto.keyBackend,
+          },
+        });
+      }
+      default:
+        return err("unknown_tool", `Unknown tool: ${name}`);
+    }
+  } catch (e) {
+    return err("internal_error", e instanceof Error ? e.message : String(e));
+  }
+}
+
+/** MCP tool handler over daemon IPC (production path). */
+export async function handleMemoryToolRemote(
+  client: IpcClient,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<ToolResult> {
+  try {
+    switch (name) {
+      case "memory_search": {
+        const query = String(args.query ?? "").trim();
+        if (!query) return err("invalid_argument", "query is required and must be non-empty");
+        const limit = clampInt(args.limit, 10, 1, 100);
+        const offset = clampInt(args.offset, 0, 0, 10_000);
+        const started = Date.now();
+        const raw = await client.call<SearchHit[]>("search", {
+          query,
+          limit,
+          offset,
+          types: parseTypes(args.types),
+          pathPrefix: args.pathPrefix != null ? String(args.pathPrefix) : undefined,
+          sinceMs: args.sinceMs != null ? Number(args.sinceMs) : undefined,
+          untilMs: args.untilMs != null ? Number(args.untilMs) : undefined,
+        });
+        const hits = raw.map((h) => ({
+          id: h.entity.id,
+          type: h.entity.type,
+          title: h.entity.title,
+          path: h.entity.path,
+          score: Number(h.score.toFixed(4)),
+          bm25: h.bm25,
+          matchedTerms: h.matchedTerms,
+          snippet: h.snippet,
+          lastSeenAt: h.entity.lastSeenAt,
+          source: h.entity.source,
+        }));
+        return ok({
+          ok: true,
+          query,
+          count: hits.length,
+          limit,
+          offset,
+          latencyMs: Date.now() - started,
+          hits,
+        });
+      }
+      case "memory_recent": {
+        const limit = clampInt(args.limit, 10, 1, 100);
+        const offset = clampInt(args.offset, 0, 0, 10_000);
+        const includeEvents = args.includeEvents !== false;
+        const entities = (
+          await client.call<MemoryEntity[]>("recent", {
+            limit,
+            offset,
+            types: parseTypes(args.types),
+            pathPrefix: args.pathPrefix != null ? String(args.pathPrefix) : undefined,
+            sinceMs: args.sinceMs != null ? Number(args.sinceMs) : undefined,
+            untilMs: args.untilMs != null ? Number(args.untilMs) : undefined,
+          })
+        ).map(serializeEntity);
+        const events = includeEvents
+          ? (
+              await client.call<MemoryEvent[]>("recentEvents", {
+                limit,
+                sinceMs: args.sinceMs != null ? Number(args.sinceMs) : undefined,
+              })
+            ).map(serializeEvent)
+          : [];
+        return ok({ ok: true, count: entities.length, limit, offset, entities, events });
+      }
+      case "memory_get": {
+        const id = String(args.id ?? "");
+        if (id.length < 8) return err("invalid_argument", "id must be at least 8 characters");
+        const entity = await client.call<MemoryEntity | null>("getEntity", { id });
+        if (!entity) return err("not_found", `No entity with id ${id}`, { id });
+        const includeLinks = args.includeLinks !== false;
+        const links = includeLinks
+          ? await client.call<MemoryLink[]>("getLinks", { entityId: id })
+          : [];
+        return ok({ ok: true, entity: serializeEntity(entity), links });
+      }
+      case "memory_relate": {
+        const fromId = String(args.fromId ?? "");
+        const toId = String(args.toId ?? "");
+        const relation = String(args.relation ?? "related_to");
+        const weight = Number(args.weight ?? 1);
+        if (!(await client.call("getEntity", { id: fromId }))) {
+          return err("not_found", "fromId does not exist", { fromId });
+        }
+        if (!(await client.call("getEntity", { id: toId }))) {
+          return err("not_found", "toId does not exist", { toId });
+        }
+        if (!relation.trim()) return err("invalid_argument", "relation is required");
+        const link = await client.call("relate", { fromId, toId, relation, weight });
+        return ok({ ok: true, link });
+      }
+      case "memory_context": {
+        const minutes = clampInt(args.minutes, 30, 1, 24 * 60);
+        const ctx = await client.call<ContextSummary>("context", { minutes });
+        return ok({ ok: true, ...ctx });
+      }
+      case "memory_status": {
+        const status = await client.call<{
+          store: Record<string, unknown>;
+          daemon: Record<string, unknown>;
+        }>("status");
+        return ok({
+          ok: true,
+          app: APP_NAME,
+          version: APP_VERSION,
+          store: status.store,
+          daemon: status.daemon,
+          privacy: {
+            localOnly: true,
+            telemetry: false,
+            secretsRedacted: true,
+            encryptedFields: true,
+            fieldEncryption: true,
+            ftsPlaintextWhileUnlocked: true,
+            sealedEnvelopeAtRest: true,
+            dbSealedOnStop: true,
+            keyBackend: (status.store as { keyBackend?: string }).keyBackend,
           },
         });
       }
@@ -268,6 +413,24 @@ export function renderPrompt(
   if (name === "search_project_memory") {
     const query = args.query ?? "";
     const hits = store.search(query, { limit: 8 });
+    return `Search results for "${query}":\n${JSON.stringify(hits.map((h) => ({ title: h.entity.title, path: h.entity.path, score: h.score, snippet: h.snippet })), null, 2)}\nUse these to answer accurately; prefer file paths that exist locally.`;
+  }
+  return `Unknown prompt: ${name}`;
+}
+
+export async function renderPromptRemote(
+  client: IpcClient,
+  name: string,
+  args: Record<string, string>,
+): Promise<string> {
+  if (name === "recall_recent_work") {
+    const minutes = Number(args.minutes ?? 30);
+    const ctx = await client.call<ContextSummary>("context", { minutes });
+    return `Using ambient memory context below, summarize what the user was working on.\n\n${ctx.narrative}\n\nJSON:\n${JSON.stringify(ctx, null, 2)}`;
+  }
+  if (name === "search_project_memory") {
+    const query = args.query ?? "";
+    const hits = await client.call<SearchHit[]>("search", { query, limit: 8 });
     return `Search results for "${query}":\n${JSON.stringify(hits.map((h) => ({ title: h.entity.title, path: h.entity.path, score: h.score, snippet: h.snippet })), null, 2)}\nUse these to answer accurately; prefer file paths that exist locally.`;
   }
   return `Unknown prompt: ${name}`;

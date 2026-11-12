@@ -1,7 +1,11 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import Database from "better-sqlite3";
+import {
+  openSqliteDatabase,
+  openSqliteDatabaseSync,
+  type SqliteDatabase,
+} from "../store/sqlite.js";
 
 export interface BrowserHistoryEntry {
   url: string;
@@ -109,6 +113,17 @@ function detectSource(filePath: string): "chrome" | "firefox" {
   return "chrome";
 }
 
+function openCopiedDb(tmp: string): SqliteDatabase {
+  try {
+    // Chrome visit_time is µs since 1601 — exceeds Number.MAX_SAFE_INTEGER
+    return openSqliteDatabaseSync(tmp, { readBigInts: true });
+  } catch {
+    throw new Error(
+      "Browser history read requires Node 22+ (node:sqlite) or async sql.js path — skipping",
+    );
+  }
+}
+
 export function readChromeFamily(
   historyPath: string,
   source: string,
@@ -117,9 +132,9 @@ export function readChromeFamily(
   const tmp = path.join(os.tmpdir(), `ambient-browser-${source}-${process.pid}.db`);
   if (!copyForRead(historyPath, tmp)) return [];
   try {
-    const db = new Database(tmp, { readonly: true, fileMustExist: true });
+    const db = openCopiedDb(tmp);
     const chromeEpochOffset = 11644473600000;
-    const sinceChrome = (sinceMs + chromeEpochOffset) * 1000;
+    const sinceChrome = BigInt(sinceMs + chromeEpochOffset) * 1000n;
     const rows = db
       .prepare(
         `SELECT u.url AS url, u.title AS title, MAX(v.visit_time) AS visit_time
@@ -130,14 +145,18 @@ export function readChromeFamily(
          ORDER BY visit_time DESC
          LIMIT 50`,
       )
-      .all(sinceChrome) as Array<{ url: string; title: string; visit_time: number }>;
+      .all(sinceChrome) as Array<{ url: string; title: string; visit_time: number | bigint }>;
     db.close();
-    return rows.map((r) => ({
-      url: r.url,
-      title: r.title || r.url,
-      lastVisitAt: Math.floor(r.visit_time / 1000 - chromeEpochOffset),
-      source,
-    }));
+    return rows.map((r) => {
+      const visit = typeof r.visit_time === "bigint" ? r.visit_time : BigInt(Number(r.visit_time));
+      const ms = Number(visit / 1000n) - chromeEpochOffset;
+      return {
+        url: String(r.url),
+        title: String(r.title || r.url),
+        lastVisitAt: Math.floor(ms),
+        source,
+      };
+    });
   } catch {
     return [];
   } finally {
@@ -153,8 +172,8 @@ export function readFirefox(placesPath: string, sinceMs: number): BrowserHistory
   const tmp = path.join(os.tmpdir(), `ambient-browser-firefox-${process.pid}.db`);
   if (!copyForRead(placesPath, tmp)) return [];
   try {
-    const db = new Database(tmp, { readonly: true, fileMustExist: true });
-    const sinceUs = sinceMs * 1000;
+    const db = openCopiedDb(tmp);
+    const sinceUs = BigInt(sinceMs) * 1000n;
     const rows = db
       .prepare(
         `SELECT p.url AS url, COALESCE(p.title, p.url) AS title, MAX(h.visit_date) AS visit_date
@@ -165,14 +184,17 @@ export function readFirefox(placesPath: string, sinceMs: number): BrowserHistory
          ORDER BY visit_date DESC
          LIMIT 50`,
       )
-      .all(sinceUs) as Array<{ url: string; title: string; visit_date: number }>;
+      .all(sinceUs) as Array<{ url: string; title: string; visit_date: number | bigint }>;
     db.close();
-    return rows.map((r) => ({
-      url: r.url,
-      title: r.title,
-      lastVisitAt: Math.floor(r.visit_date / 1000),
-      source: "firefox",
-    }));
+    return rows.map((r) => {
+      const visit = typeof r.visit_date === "bigint" ? r.visit_date : BigInt(Number(r.visit_date));
+      return {
+        url: String(r.url),
+        title: String(r.title),
+        lastVisitAt: Math.floor(Number(visit / 1000n)),
+        source: "firefox",
+      };
+    });
   } catch {
     return [];
   } finally {
@@ -184,16 +206,13 @@ export function readFirefox(placesPath: string, sinceMs: number): BrowserHistory
   }
 }
 
-/**
- * Build a minimal Chrome History SQLite DB for fixtures / smoke tests.
- */
 export function writeChromeHistoryFixture(
   destPath: string,
   visits: Array<{ url: string; title: string; visitedAtMs: number }>,
 ): void {
   fs.mkdirSync(path.dirname(destPath), { recursive: true });
   if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
-  const db = new Database(destPath);
+  const db = openSqliteDatabaseSync(destPath);
   db.exec(`
     CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT, title TEXT);
     CREATE TABLE visits (id INTEGER PRIMARY KEY, url INTEGER, visit_time INTEGER);
@@ -206,19 +225,17 @@ export function writeChromeHistoryFixture(
     insUrl.run(id, v.url, v.title);
     insVisit.run(id, id, (v.visitedAtMs + chromeEpochOffset) * 1000);
   });
+  db.persist();
   db.close();
 }
 
-/**
- * Build a minimal Firefox places.sqlite for fixtures / smoke tests.
- */
 export function writeFirefoxPlacesFixture(
   destPath: string,
   visits: Array<{ url: string; title: string; visitedAtMs: number }>,
 ): void {
   fs.mkdirSync(path.dirname(destPath), { recursive: true });
   if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
-  const db = new Database(destPath);
+  const db = openSqliteDatabaseSync(destPath);
   db.exec(`
     CREATE TABLE moz_places (id INTEGER PRIMARY KEY, url TEXT, title TEXT);
     CREATE TABLE moz_historyvisits (id INTEGER PRIMARY KEY, place_id INTEGER, visit_date INTEGER);
@@ -232,13 +249,73 @@ export function writeFirefoxPlacesFixture(
     insPlace.run(id, v.url, v.title);
     insVisit.run(id, id, v.visitedAtMs * 1000);
   });
+  db.persist();
+  db.close();
+}
+
+/** Async fixture writers for Node 20 / sql.js environments. */
+export async function writeChromeHistoryFixtureAsync(
+  destPath: string,
+  visits: Array<{ url: string; title: string; visitedAtMs: number }>,
+): Promise<void> {
+  try {
+    writeChromeHistoryFixture(destPath, visits);
+    return;
+  } catch {
+    /* fall through to async */
+  }
+  fs.mkdirSync(path.dirname(destPath), { recursive: true });
+  if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+  const db = await openSqliteDatabase(destPath);
+  db.exec(`
+    CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT, title TEXT);
+    CREATE TABLE visits (id INTEGER PRIMARY KEY, url INTEGER, visit_time INTEGER);
+  `);
+  const chromeEpochOffset = 11644473600000;
+  const insUrl = db.prepare(`INSERT INTO urls(id, url, title) VALUES (?, ?, ?)`);
+  const insVisit = db.prepare(`INSERT INTO visits(id, url, visit_time) VALUES (?, ?, ?)`);
+  visits.forEach((v, i) => {
+    const id = i + 1;
+    insUrl.run(id, v.url, v.title);
+    insVisit.run(id, id, (v.visitedAtMs + chromeEpochOffset) * 1000);
+  });
+  db.persist();
+  db.close();
+}
+
+export async function writeFirefoxPlacesFixtureAsync(
+  destPath: string,
+  visits: Array<{ url: string; title: string; visitedAtMs: number }>,
+): Promise<void> {
+  try {
+    writeFirefoxPlacesFixture(destPath, visits);
+    return;
+  } catch {
+    /* fall through */
+  }
+  fs.mkdirSync(path.dirname(destPath), { recursive: true });
+  if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+  const db = await openSqliteDatabase(destPath);
+  db.exec(`
+    CREATE TABLE moz_places (id INTEGER PRIMARY KEY, url TEXT, title TEXT);
+    CREATE TABLE moz_historyvisits (id INTEGER PRIMARY KEY, place_id INTEGER, visit_date INTEGER);
+  `);
+  const insPlace = db.prepare(`INSERT INTO moz_places(id, url, title) VALUES (?, ?, ?)`);
+  const insVisit = db.prepare(
+    `INSERT INTO moz_historyvisits(id, place_id, visit_date) VALUES (?, ?, ?)`,
+  );
+  visits.forEach((v, i) => {
+    const id = i + 1;
+    insPlace.run(id, v.url, v.title);
+    insVisit.run(id, id, v.visitedAtMs * 1000);
+  });
+  db.persist();
   db.close();
 }
 
 export function readRecentBrowserHistory(options?: {
   home?: string;
   sinceMs?: number;
-  /** Explicit DB file paths (Chrome History or Firefox places.sqlite). */
   historyPaths?: string[];
 }): { entries: BrowserHistoryEntry[]; result: BrowserIndexResult } {
   const home = options?.home ?? os.homedir();

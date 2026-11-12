@@ -2,7 +2,40 @@ import os from "node:os";
 import path from "node:path";
 
 export const APP_NAME = "ambient-memory";
-export const APP_VERSION = "0.2.1";
+export const APP_VERSION = "0.3.0";
+
+/** Apps that rarely carry engineering signal when focused. */
+export const DEFAULT_NOISY_APPS = [
+  "Slack",
+  "Discord",
+  "Spotify",
+  "Music",
+  "Apple Music",
+  "iTunes",
+  "Teams",
+  "Microsoft Teams",
+  "Zoom",
+  "zoom.us",
+  "Finder",
+  "Explorer",
+  "System Settings",
+  "System Preferences",
+  "Notification Center",
+  "Control Center",
+  "Wallpaper",
+  "loginwindow",
+  "Dock",
+  "Window Server",
+  "Messages",
+  "WhatsApp",
+  "Telegram",
+  "Signal",
+  "Mail",
+  "Outlook",
+  "Calendar",
+  "Photos",
+  "Photos App",
+] as const;
 
 export function defaultDataDir(home = os.homedir()): string {
   return path.join(home, ".ambient-memory");
@@ -53,6 +86,8 @@ export interface AmbientConfig {
   keyPath: string;
   pidPath: string;
   logPath: string;
+  /** Unix socket path or Windows named pipe. */
+  socketPath?: string;
   watchRoots: string[];
   excludePaths: string[];
   ignoreGlobs: string[];
@@ -68,6 +103,10 @@ export interface AmbientConfig {
   telemetry: false;
   screenProvider?: "auto" | "simulated" | "none";
   browserHistoryPaths?: string[];
+  /** Focus apps skipped for session indexing. */
+  noisyApps: string[];
+  /** Skip re-indexing identical focus within this window. */
+  focusDedupeWindowMs: number;
 }
 
 export function buildConfig(overrides: Partial<AmbientConfig> = {}): AmbientConfig {
@@ -78,6 +117,7 @@ export function buildConfig(overrides: Partial<AmbientConfig> = {}): AmbientConf
     keyPath: overrides.keyPath ?? path.join(dataDir, "master.key"),
     pidPath: overrides.pidPath ?? path.join(dataDir, "daemon.pid"),
     logPath: overrides.logPath ?? path.join(dataDir, "daemon.log"),
+    socketPath: overrides.socketPath,
     watchRoots: overrides.watchRoots ?? defaultWatchRoots(),
     excludePaths: overrides.excludePaths ?? [],
     ignoreGlobs: overrides.ignoreGlobs ?? [...DEFAULT_IGNORE_GLOBS],
@@ -93,5 +133,7 @@ export function buildConfig(overrides: Partial<AmbientConfig> = {}): AmbientConf
     telemetry: false,
     screenProvider: overrides.screenProvider ?? "auto",
     browserHistoryPaths: overrides.browserHistoryPaths,
+    noisyApps: overrides.noisyApps ?? [...DEFAULT_NOISY_APPS],
+    focusDedupeWindowMs: overrides.focusDedupeWindowMs ?? 60_000,
   };
 }
