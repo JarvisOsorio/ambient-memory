@@ -1,8 +1,11 @@
 import fs from "node:fs";
 import type { AmbientConfig } from "../config/defaults.js";
+import { startIpcServer, type IpcServerHandle } from "../ipc/server.js";
+import { ipcEndpoint } from "../ipc/paths.js";
 import { MemoryStore } from "../store/memory-store.js";
 import { readRecentBrowserHistory } from "./browser.js";
 import { RotatingLogger } from "./logging.js";
+import { focusDedupeKey, shouldIndexFocus } from "./noise.js";
 import {
   acquirePidFile,
   isProcessAlive,
@@ -26,6 +29,8 @@ export interface DaemonStatus {
   watcher?: WatcherStats;
   dryRun?: boolean;
   store?: ReturnType<MemoryStore["status"]>;
+  ipcEndpoint?: string;
+  sqliteBackend?: string;
 }
 
 export class AmbientDaemon {
@@ -36,9 +41,12 @@ export class AmbientDaemon {
   private screenTimer?: NodeJS.Timeout;
   private browserTimer?: NodeJS.Timeout;
   private lastSessionId?: string;
+  private lastFocusKey?: string;
+  private lastFocusAt?: number;
   private started = false;
   private logger: RotatingLogger;
   private owningPid = false;
+  private ipc?: IpcServerHandle;
   browserNote?: { indexed: number; skippedReason?: string; sourcePath?: string };
 
   constructor(config: AmbientConfig, store?: MemoryStore) {
@@ -66,6 +74,9 @@ export class AmbientDaemon {
     if (!this.store) {
       this.store = await MemoryStore.openAsync(this.config);
     }
+
+    this.ipc = await startIpcServer(this.config, this.store, this);
+    this.logger.info("ipc_listen", { endpoint: this.ipc.endpoint });
 
     this.watcher = startFileWatcher(this.store, this.config.watchRoots, {
       config: this.config,
@@ -103,12 +114,14 @@ export class AmbientDaemon {
 
     this.store.addEvent({
       kind: "daemon_start",
-      summary: `Ambient daemon started (screen=${this.screen.name}, key=${this.store.crypto.keyBackend})`,
+      summary: `Ambient daemon started (screen=${this.screen.name}, key=${this.store.crypto.keyBackend}, sqlite=${this.store.db.backend})`,
       payload: {
         roots: this.watcher.roots,
         pid: process.pid,
         keyBackend: this.store.crypto.keyBackend,
+        sqliteBackend: this.store.db.backend,
         dryRun: this.config.dryRun,
+        ipc: this.ipc.endpoint,
       },
     });
 
@@ -117,8 +130,10 @@ export class AmbientDaemon {
       pid: process.pid,
       screen: this.screen.name,
       key: this.store.crypto.keyBackend,
+      sqlite: this.store.db.backend,
       dryRun: this.config.dryRun,
       roots: this.watcher.roots.length,
+      ipc: this.ipc.endpoint,
     });
   }
 
@@ -128,21 +143,57 @@ export class AmbientDaemon {
       const snap = await this.screen.capture();
       if (!snap) return;
 
+      const decision = shouldIndexFocus(
+        {
+          appName: snap.appName,
+          windowTitle: snap.windowTitle,
+          capturedAt: snap.capturedAt,
+        },
+        {
+          lastKey: this.lastFocusKey,
+          lastAt: this.lastFocusAt,
+          dedupeWindowMs: this.config.focusDedupeWindowMs,
+          noisyApps: this.config.noisyApps,
+        },
+      );
+
+      if (!decision.index) {
+        if (decision.reason === "deduped" && this.lastSessionId) {
+          // Touch last_seen without rewriting body
+          this.store.upsertEntity({
+            id: this.lastSessionId,
+            type: "session",
+            title: `${snap.appName}: ${snap.windowTitle}`,
+            source: "screen",
+            skipIfUnchanged: true,
+            metadata: {
+              appName: snap.appName,
+              windowTitle: snap.windowTitle,
+              provider: snap.provider,
+              noisy: decision.noisy,
+            },
+          });
+        }
+        this.lastFocusKey = focusDedupeKey(snap);
+        this.lastFocusAt = snap.capturedAt;
+        return;
+      }
+
+      const title = `${snap.appName}: ${snap.windowTitle}`;
       const isNew =
-        !this.lastSessionId ||
-        this.store.getEntity(this.lastSessionId)?.title !==
-          `${snap.appName}: ${snap.windowTitle}`;
+        !this.lastSessionId || this.store.getEntity(this.lastSessionId)?.title !== title;
 
       const session = this.store.upsertEntity({
-        id: this.lastSessionId,
+        id: isNew ? undefined : this.lastSessionId,
         type: "session",
-        title: `${snap.appName}: ${snap.windowTitle}`,
+        title,
         body: `Active window via ${snap.provider}`,
         source: "screen",
         metadata: {
           appName: snap.appName,
           windowTitle: snap.windowTitle,
           provider: snap.provider,
+          noisy: decision.noisy,
         },
       });
       if (!session) return;
@@ -154,11 +205,13 @@ export class AmbientDaemon {
         this.store.beginSession(session.title, session.id);
       }
       this.lastSessionId = session.id;
+      this.lastFocusKey = focusDedupeKey(snap);
+      this.lastFocusAt = snap.capturedAt;
       this.store.addEvent({
         kind: "screen_focus",
         summary: `${snap.appName} — ${snap.windowTitle}`,
         entityId: session.id,
-        payload: { ...snap },
+        payload: { ...snap, noisy: decision.noisy },
       });
     } catch (err) {
       this.logger.warn("screen_capture_failed", {
@@ -214,6 +267,10 @@ export class AmbientDaemon {
     if (this.screenTimer) clearInterval(this.screenTimer);
     if (this.browserTimer) clearInterval(this.browserTimer);
     if (this.watcher) await this.watcher.close();
+    if (this.ipc) {
+      await this.ipc.close();
+      this.ipc = undefined;
+    }
     if (this.lastSessionId) {
       try {
         this.store.endSession(this.lastSessionId);
@@ -251,6 +308,8 @@ export class AmbientDaemon {
       browser: this.browserNote,
       watcher: this.watcher?.stats,
       dryRun: this.config.dryRun,
+      ipcEndpoint: this.ipc?.endpoint ?? ipcEndpoint(this.config),
+      sqliteBackend: this.store?.db.backend,
       store:
         this.store && (this.started || fs.existsSync(this.config.dbPath))
           ? this.store.status()
