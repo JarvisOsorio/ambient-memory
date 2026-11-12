@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }} · Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [20, 22]
+        include:
+          - os: windows-latest
+            node: 22
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install (Unix)
+        if: runner.os != 'Windows'
+        run: npm ci
+
+      - name: Install (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # better-sqlite3 needs a working MSVC toolchain / windows-build-tools equivalent.
+          # GitHub windows-latest images include Visual Studio Build Tools.
+          npm ci
+
+      - name: Test
+        env:
+          AMBIENT_FORCE_FILE_KEY: "1"
+        run: npm test
+
+      - name: Demo smoke
+        env:
+          AMBIENT_FORCE_FILE_KEY: "1"
+        run: npm run demo
+
+      - name: Pack dry-run
+        run: npm pack --dry-run

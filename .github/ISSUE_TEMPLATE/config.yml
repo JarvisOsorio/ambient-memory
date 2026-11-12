@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Privacy / security concern
+    url: https://github.com/JarvisOsorio/ambient-memory/security/advisories/new
+    about: Please use private advisories for secret-handling issues.
