@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/server.json",
+  "name": "io.github.JarvisOsorio/ambient-memory",
+  "description": "Zero-config local ambient memory for AI agents — encrypted graph + MCP",
+  "repository": {
+    "url": "https://github.com/JarvisOsorio/ambient-memory",
+    "source": "github"
+  },
+  "version": "0.3.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "ambient-memory",
+      "version": "0.3.0",
+      "transport": {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "ambient-memory", "mcp"]
+      }
+    }
+  ]
+}

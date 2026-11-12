@@ -1,5 +1,11 @@
 # ambient-memory
 
+[![CI](https://github.com/JarvisOsorio/ambient-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/JarvisOsorio/ambient-memory/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/ambient-memory.svg)](https://www.npmjs.com/package/ambient-memory)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
+[![MCP](https://img.shields.io/badge/MCP-stdio-blue)](https://modelcontextprotocol.io)
+
 **Zero-config ambient memory for AI engineers** — a local-first context layer that passively remembers what you worked on and exposes it to Cursor / Claude Desktop over MCP.
 
 No Markdown vault. No Git sync. No OAuth. No native C++ / `node-gyp` install. After npm publish:

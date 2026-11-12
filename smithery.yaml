@@ -1,0 +1,25 @@
+# Smithery.ai MCP server manifest for ambient-memory
+# Submit/claim: https://smithery.ai/ — connect GitHub JarvisOsorio/ambient-memory
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties:
+      AMBIENT_FORCE_FILE_KEY:
+        type: string
+        description: Set to "1" to force file-backed master key (skip OS keychain)
+      AMBIENT_SQLITE_BACKEND:
+        type: string
+        enum: ["node-sqlite", "sql.js"]
+        description: Optional SQLite backend override
+  commandFunction: |-
+    (config) => ({
+      command: 'npx',
+      args: ['-y', 'ambient-memory', 'mcp'],
+      env: Object.fromEntries(
+        Object.entries({
+          AMBIENT_FORCE_FILE_KEY: config.AMBIENT_FORCE_FILE_KEY,
+          AMBIENT_SQLITE_BACKEND: config.AMBIENT_SQLITE_BACKEND,
+        }).filter(([, v]) => v != null && v !== '')
+      ),
+    })

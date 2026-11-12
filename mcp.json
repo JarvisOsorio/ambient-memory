@@ -1,0 +1,31 @@
+{
+  "name": "ambient-memory",
+  "version": "0.3.0",
+  "description": "Zero-config local ambient memory for AI agents — encrypted vault + MCP (daemon-owned SQLite, no native C++).",
+  "homepage": "https://github.com/JarvisOsorio/ambient-memory",
+  "license": "MIT",
+  "runtime": "node",
+  "packages": [
+    {
+      "registry": "npm",
+      "name": "ambient-memory",
+      "version": "0.3.0"
+    }
+  ],
+  "tools": [
+    "memory_search",
+    "memory_recent",
+    "memory_get",
+    "memory_context",
+    "memory_relate",
+    "memory_status"
+  ],
+  "transports": [
+    {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "ambient-memory", "mcp"]
+    }
+  ],
+  "keywords": ["mcp", "memory", "local-first", "sqlite", "cursor", "claude"]
+}
