@@ -1,20 +1,19 @@
 # ambient-memory
 
 [![CI](https://github.com/JarvisOsorio/ambient-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/JarvisOsorio/ambient-memory/actions/workflows/ci.yml)
+[![GitHub stars](https://img.shields.io/github/stars/JarvisOsorio/ambient-memory?style=social)](https://github.com/JarvisOsorio/ambient-memory/stargazers)
 [![npm](https://img.shields.io/npm/v/ambient-memory.svg)](https://www.npmjs.com/package/ambient-memory)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
 [![MCP](https://img.shields.io/badge/MCP-stdio-blue)](https://modelcontextprotocol.io)
 
+**⭐ [Star this repo](https://github.com/JarvisOsorio/ambient-memory)** if local agent memory without a Markdown vault sounds useful.
+
 **Zero-config ambient memory for AI engineers** — a local-first context layer that passively remembers what you worked on and exposes it to Cursor / Claude Desktop over MCP.
 
-No Markdown vault. No Git sync. No OAuth. No native C++ / `node-gyp` install. After npm publish:
+Project page: [jarvisosorio.com/ambient-memory/](https://jarvisosorio.com/ambient-memory/) · Also by Jarvis: [mcp-pordego](https://github.com/JarvisOsorio/mcp-pordego) (MCP security scanner)
 
-```bash
-npx -y ambient-memory init
-npx -y ambient-memory start --screen auto
-npx -y ambient-memory mcp
-```
+No Markdown vault. No Git sync. No OAuth. No native C++ / `node-gyp` install.
 
 ```mermaid
 flowchart LR
@@ -43,39 +42,54 @@ flowchart LR
 
 1. **True zero-config install** — `node:sqlite` on Node 22+, `sql.js` WASM fallback on Node 20. No `better-sqlite3`.
 2. **Daemon-owned vault** — only the daemon opens/seals SQLite; CLI/MCP are IPC clients (no seal races).
-3. **npx-ready** — `ambient` and `ambient-memory` bins for `npx -y ambient-memory mcp`.
-4. **Honest crypto** — AES-GCM field encryption + sealed `.enc` at rest; FTS is redacted plaintext while unlocked (documented, not theater).
-5. **Noise control** — ignore Slack/Spotify/etc., dedupe focus churn, session summarization for signal-heavy `memory_context`.
+3. **Honest crypto** — AES-GCM field encryption + sealed `.enc` at rest; FTS is redacted plaintext while unlocked (documented, not theater).
+4. **Noise control** — ignore Slack/Spotify/etc., dedupe focus churn, session summarization for signal-heavy `memory_context`.
+5. **npx-ready bins** — `ambient` and `ambient-memory` (use after npm publish).
 
-## Install
+## Install (from source — works now)
 
 Requires **Node.js 20+** (22+ preferred for built-in SQLite).
 
-```bash
-# after publish
-npx -y ambient-memory init
-npx -y ambient-memory start --screen auto    # headless: --screen simulated
+`ambient-memory` is **not on the npm registry yet**. Install from GitHub:
 
-# from this repo (pre-publish)
+```bash
+git clone https://github.com/JarvisOsorio/ambient-memory.git
+cd ambient-memory
 npm install
 npm test
 node ./bin/ambient.js init
+node ./bin/ambient.js start --screen auto    # headless: --screen simulated
+node ./bin/ambient.js mcp
 ```
 
-### MCP — Cursor
+From the repo, use `node ./bin/ambient.js` anywhere you see `ambient-memory` below.
+
+### After npm publish
+
+Once [ambient-memory](https://www.npmjs.com/package/ambient-memory) is published (see [PUBLISH.md](./PUBLISH.md)):
+
+```bash
+npx -y ambient-memory init
+npx -y ambient-memory start --screen auto
+npx -y ambient-memory mcp
+```
+
+Do **not** rely on `npx -y ambient-memory` until `npm view ambient-memory version` succeeds.
+
+### MCP — Cursor / Claude Desktop (from clone)
 
 ```json
 {
   "mcpServers": {
     "ambient-memory": {
-      "command": "npx",
-      "args": ["-y", "ambient-memory", "mcp"]
+      "command": "node",
+      "args": ["/ABS/PATH/ambient-memory/bin/ambient.js", "mcp"]
     }
   }
 }
 ```
 
-### MCP — Claude Desktop
+### MCP — after npm publish
 
 ```json
 {
@@ -120,6 +134,11 @@ See [SECURITY.md](./SECURITY.md).
 - **CLI / MCP** never open SQLite directly in normal operation
 
 Force WASM backend: `AMBIENT_SQLITE_BACKEND=sql.js`. Force file key: `--file-key` / `AMBIENT_FORCE_FILE_KEY=1`.
+
+## Related
+
+- Project site: [jarvisosorio.com/ambient-memory/](https://jarvisosorio.com/ambient-memory/)
+- [mcp-pordego](https://github.com/JarvisOsorio/mcp-pordego) — MCP security scanner by Jarvis Osorio ([site](https://jarvisosorio.com/mcp-pordego/))
 
 ## Development
 
